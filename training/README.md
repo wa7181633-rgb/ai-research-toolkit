@@ -1,17 +1,23 @@
-# Training & Alignment
+# Training Module (Advanced)
 
-Modern post-training techniques focused on **reasoning** and **efficiency**.
+## Main Entry Points
 
-## Modules
+| File | Purpose |
+|------|--------|
+| `grpo_math_train.py` | Full GRPO pipeline for math reasoning |
+| `rewards.py` | Reusable strong reward functions |
+| `train.py` | Basic SFT starter (kept for reference) |
 
-- **[grpo/](./grpo)** — Group Relative Policy Optimization (DeepSeek R1 style)
-- **[unsloth/](./unsloth)** — Memory-efficient fine-tuning recipes
-- **[lora-dora/](./lora-dora)** — LoRA, DoRA, and rank-stabilized adapters
+## Recommended Workflow
 
-## Recommended Stack (2026)
+1. Generate or load a high-quality dataset (`../pipeline/synthetic_data.py` or GSM8K/MATH)
+2. (Optional) Run a short SFT stage for format learning
+3. Run GRPO with the multi-component rewards in `rewards.py`
+4. Evaluate with `../evaluation/eval_gsm8k.py`
 
-```bash
-pip install unsloth trl peft transformers datasets accelerate
-```
+## Key Design Choices
 
-Unsloth + TRL is currently the most practical way to run GRPO on consumer GPUs (even 1.5B–8B models on 8–16 GB VRAM).
+- **Unsloth** for memory efficiency and speed
+- **Multiple reward functions** instead of a single weak signal
+- **Explicit `<thought>` + `<answer>` format** for easier process supervision and evaluation
+- **Group size (`num_generations`)** is one of the most important hyperparameters in GRPO

@@ -1,12 +1,16 @@
-# Inference & Optimization
+# Inference Module (Advanced)
 
-High-throughput, low-latency serving techniques.
+## Key File
 
-## Focus Areas
+- `vllm_server.py` — High-performance vLLM configuration with:
+  - FP8 KV cache
+  - Prefix caching
+  - Controlled memory utilization
+  - Ready for tensor parallel
 
-- **vLLM + PagedAttention** — the current standard for open-source serving
-- **FlashAttention-3** — critical for Hopper / Blackwell speed
-- **FP8 / quantization** — weights + KV cache
-- **Speculative decoding** — big latency wins on supported models
+## Best Practices Applied
 
-See subfolders for concrete configs and recipes.
+- Prefer `kv_cache_dtype="fp8"` on Hopper and newer
+- Set `max_model_len` to the actual needed context (not the model maximum)
+- Keep `gpu_memory_utilization` around 0.90–0.93
+- Enable prefix caching for chat / agent workloads
