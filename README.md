@@ -11,9 +11,15 @@ Production-structured research scripts for **SFT -> GRPO reasoning alignment**, 
 - `interpretability/residual_probe.py`: Transformer Lens residual stream probe (`hook_resid_post` + `apply_ln_to_stack` + unembedding) tracking candidate token probabilities across layers.
 - `requirements.txt`: Dependencies for training, GRPO/SFT, vLLM, and interpretability.
 
+## Platform Direction
+
+The target direction is a **Quantum-AI research platform**: preserve and stabilize the existing classical AI pipeline, then add optional quantum and hybrid classical-quantum experiment backends. The roadmap defines the architecture, NVIDIA technology alignment, research tracks (QNN and QAOA), experiment metadata, and phased delivery criteria.
+
+See [docs/QUANTUM_AI_PLATFORM_ROADMAP.md](docs/QUANTUM_AI_PLATFORM_ROADMAP.md).
+
 ## Engineering Audit
 
-See [`docs/NVIDIA_SKILLS_ALIGNMENT_AUDIT.md`](docs/NVIDIA_SKILLS_ALIGNMENT_AUDIT.md) for a static readiness review, NVIDIA Skills catalog mapping, prioritized gaps, and recommended next steps. Runtime/GPU validation is explicitly marked separately.
+See [docs/NVIDIA_SKILLS_ALIGNMENT_AUDIT.md](docs/NVIDIA_SKILLS_ALIGNMENT_AUDIT.md) for a static readiness review, NVIDIA Skills catalog mapping, prioritized gaps, and recommended next steps. Runtime/GPU validation is explicitly marked separately.
 
 ## Quick Execution Flow
 
