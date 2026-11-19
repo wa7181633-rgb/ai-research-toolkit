@@ -11,6 +11,10 @@ Production-structured research scripts for **SFT -> GRPO reasoning alignment**, 
 - `interpretability/residual_probe.py`: Transformer Lens residual stream probe (`hook_resid_post` + `apply_ln_to_stack` + unembedding) tracking candidate token probabilities across layers.
 - `requirements.txt`: Dependencies for training, GRPO/SFT, vLLM, and interpretability.
 
+## Engineering Audit
+
+See [`docs/NVIDIA_SKILLS_ALIGNMENT_AUDIT.md`](docs/NVIDIA_SKILLS_ALIGNMENT_AUDIT.md) for a static readiness review, NVIDIA Skills catalog mapping, prioritized gaps, and recommended next steps. Runtime/GPU validation is explicitly marked separately.
+
 ## Quick Execution Flow
 
 ```bash
