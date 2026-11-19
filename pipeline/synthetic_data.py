@@ -1,116 +1,172 @@
 """
-Advanced Synthetic Reasoning Data Pipeline
-==========================================
-Generates high-quality math / reasoning examples with:
-- Structured thought process
-- Explicit final answer
-- Filtering hooks for quality control
-
-In real research you would call a strong model (GPT-4o, Claude, DeepSeek-R1, etc.)
-instead of the simple template used here.
+Automated Synthetic Math Reasoning Dataset Generator with Verification & Deduplication.
+Generates step-by-step arithmetic/algebra problems, verifies answers via Python AST
+safe arithmetic evaluation, deduplicates prompts, and exports JSONL ready for SFT/GRPO.
 """
 
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
 import json
+import operator
 import random
-from typing import List, Dict
 from pathlib import Path
+from typing import Any
 
-# ======================
-# Templates & Generators
-# ======================
 
-TEMPLATES = [
-    {
-        "type": "linear_equation",
-        "prompt": "Solve for x: {a}x + {b} = {c}",
-        "thought": "Subtract {b} from both sides: {a}x = {c_minus_b}. Then divide both sides by {a}: x = {answer}.",
-        "answer_fn": lambda a, b, c: (c - b) // a if (c - b) % a == 0 else None,
-    },
-    {
-        "type": "percentage",
-        "prompt": "A product costs ${price}. It is discounted by {pct}%. What is the final price?",
-        "thought": "{pct}% of {price} is {discount}. Subtracting the discount: {price} - {discount} = {answer}.",
-        "answer_fn": lambda price, pct: price - (price * pct // 100),
-    },
-]
+_SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
 
-def generate_one() -> Dict | None:
-    template = random.choice(TEMPLATES)
 
-    if template["type"] == "linear_equation":
-        a = random.randint(2, 9)
-        b = random.randint(1, 20)
-        answer = random.randint(1, 15)
-        c = a * answer + b
-        thought = template["thought"].format(
-            a=a, b=b, c=c, c_minus_b=c-b, answer=answer
+def safe_eval_expr(expr: str) -> float:
+    """Safely evaluate pure arithmetic expressions using AST nodes."""
+    node = ast.parse(expr.strip(), mode="eval").body
+
+    def _eval(n: ast.AST) -> float:
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return float(n.value)
+        if isinstance(n, ast.BinOp) and type(n.op) in _SAFE_OPS:
+            left = _eval(n.left)
+            right = _eval(n.right)
+            if isinstance(n.op, (ast.Div, ast.FloorDiv, ast.Mod)) and right == 0:
+                raise ZeroDivisionError("Division by zero")
+            if isinstance(n.op, ast.Pow) and abs(right) > 12:
+                raise ValueError("Exponent too large")
+            return float(_SAFE_OPS[type(n.op)](left, right))
+        if isinstance(n, ast.UnaryOp) and type(n.op) in _SAFE_OPS:
+            return float(_SAFE_OPS[type(n.op)](_eval(n.operand)))
+        raise ValueError(f"Unsupported AST construct: {type(n).__name__}")
+
+    return _eval(node)
+
+
+def generate_word_problem(rng: random.Random) -> dict[str, Any]:
+    """Generate a verified multi-step word problem with explicit reasoning trace."""
+    kind = rng.choice(["inventory_batch", "discount_margin", "rate_allocation"])
+    if kind == "inventory_batch":
+        boxes = rng.randint(6, 30)
+        units_per_box = rng.randint(12, 48)
+        defective = rng.randint(1, max(2, units_per_box // 3))
+        price_per_unit = rng.choice([15, 25, 40, 50, 75, 120])
+
+        total_units = boxes * units_per_box
+        usable_units = total_units - defective
+        revenue = usable_units * price_per_unit
+        assert safe_eval_expr(f"({boxes} * {units_per_box} - {defective}) * {price_per_unit}") == float(revenue)
+
+        question = (
+            f"A warehouse receives {boxes} boxes with {units_per_box} units each. "
+            f"{defective} units are damaged and discarded. Each usable unit sells for {price_per_unit}. "
+            f"What is the total revenue from usable units?"
         )
-        prompt = template["prompt"].format(a=a, b=b, c=c)
-        return {
-            "prompt": prompt,
-            "thought": thought,
-            "answer": str(answer),
-            "type": template["type"],
-        }
-
-    elif template["type"] == "percentage":
-        price = random.choice([40, 50, 80, 100, 120, 150, 200])
-        pct = random.choice([10, 15, 20, 25, 30, 40, 50])
-        discount = price * pct // 100
-        answer = price - discount
-        thought = template["thought"].format(
-            price=price, pct=pct, discount=discount, answer=answer
+        thought = (
+            f"1. Total units = {boxes} * {units_per_box} = {total_units}.\n"
+            f"2. Usable units after discarding {defective} damaged units = {total_units} - {defective} = {usable_units}.\n"
+            f"3. Total revenue = {usable_units} * {price_per_unit} = {revenue}."
         )
-        prompt = template["prompt"].format(price=price, pct=pct)
-        return {
-            "prompt": prompt,
-            "thought": thought,
-            "answer": str(answer),
-            "type": template["type"],
-        }
+        return {"question": question, "thought": thought, "answer": str(revenue), "category": kind}
 
-    return None
+    if kind == "discount_margin":
+        base_price = rng.choice([200, 450, 800, 1200, 2500])
+        discount_pct = rng.choice([10, 15, 20, 25])
+        qty = rng.randint(3, 15)
+
+        discounted_unit = base_price * (100 - discount_pct) / 100.0
+        total_cost = discounted_unit * qty
+        assert abs(safe_eval_expr(f"{base_price} * (100 - {discount_pct}) / 100 * {qty}") - total_cost) < 1e-6
+
+        question = (
+            f"An item costs {base_price} and has a {discount_pct}% discount. "
+            f"If a buyer purchases {qty} discounted items, what is the total amount payable?"
+        )
+        thought = (
+            f"1. Discount amount per item = {base_price} * {discount_pct} / 100 = {base_price * discount_pct / 100.0:g}.\n"
+            f"2. Discounted price per item = {base_price} - {base_price * discount_pct / 100.0:g} = {discounted_unit:g}.\n"
+            f"3. Total payable for {qty} items = {discounted_unit:g} * {qty} = {total_cost:g}."
+        )
+        return {"question": question, "thought": thought, "answer": f"{total_cost:g}", "category": kind}
+
+    total_hours = rng.randint(12, 60)
+    shift_hours = rng.choice([4, 6, 8, 12])
+    hourly_rate = rng.choice([150, 250, 350, 500])
+    full_shifts = total_hours // shift_hours
+    remainder_hours = total_hours % shift_hours
+    total_payout = total_hours * hourly_rate
+    assert safe_eval_expr(f"{total_hours} * {hourly_rate}") == float(total_payout)
+
+    question = (
+        f"A process runs for {total_hours} hours across shifts of {shift_hours} hours each, "
+        f"paid at {hourly_rate} per hour. How many full shifts occur, and what is the total payout?"
+    )
+    thought = (
+        f"1. Full shifts = {total_hours} // {shift_hours} = {full_shifts} (remainder {remainder_hours}h).\n"
+        f"2. Total payout across {total_hours} hours at {hourly_rate}/hr = {total_payout}."
+    )
+    return {
+        "question": question,
+        "thought": thought,
+        "answer": str(total_payout),
+        "full_shifts": full_shifts,
+        "category": kind,
+    }
 
 
-def generate_dataset(n: int = 200, seed: int = 42) -> List[Dict]:
-    random.seed(seed)
-    dataset = []
-    seen = set()
+def build_dataset(count: int, seed: int, output_file: str) -> dict[str, Any]:
+    rng = random.Random(seed)
+    seen_hashes: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    attempts = 0
+    max_attempts = count * 10
 
-    while len(dataset) < n:
-        item = generate_one()
-        if item is None:
+    while len(rows) < count and attempts < max_attempts:
+        attempts += 1
+        item = generate_word_problem(rng)
+        digest = hashlib.sha256(item["question"].encode("utf-8")).hexdigest()
+        if digest in seen_hashes:
             continue
-        key = item["prompt"]
-        if key in seen:
-            continue
-        seen.add(key)
+        seen_hashes.add(digest)
+        item["id"] = f"syn_{len(rows) + 1:05d}"
+        item["sha256"] = digest[:16]
+        rows.append(item)
 
-        # Final structured format (ready for GRPO / SFT)
-        formatted = {
-            "prompt": item["prompt"],
-            "completion": f"<thought>\n{item['thought']}\n</thought>\n<answer>\n{item['answer']}\n</answer>",
-            "solution": item["answer"],
-            "type": item["type"],
-        }
-        dataset.append(formatted)
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row) + "\n")
 
-    return dataset
+    return {
+        "output_file": str(out_path),
+        "generated_count": len(rows),
+        "attempts": attempts,
+        "unique_questions": len(seen_hashes),
+    }
 
 
-def save_dataset(dataset: List[Dict], path: str = "synthetic_reasoning.jsonl"):
-    path = Path(path)
-    with path.open("w", encoding="utf-8") as f:
-        for item in dataset:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
-    print(f"Saved {len(dataset)} examples → {path}")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Verified Synthetic Math Dataset Pipeline")
+    parser.add_argument("--count", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--output", default="pipeline/synthetic_math_train.jsonl")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    summary = build_dataset(count=args.count, seed=args.seed, output_file=args.output)
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
-    print("Generating advanced synthetic reasoning dataset...")
-    data = generate_dataset(n=300)
-    save_dataset(data)
-
-    # Show a sample
-    print("\nSample example:")
-    print(json.dumps(data[0], indent=2))
+    main()

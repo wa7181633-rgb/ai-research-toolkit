@@ -1,85 +1,141 @@
 """
-Advanced vLLM Serving Configuration
-===================================
-Production-oriented settings for high throughput + good latency.
-
-Key techniques used:
-- PagedAttention (default in vLLM)
-- FP8 KV cache (major memory win on Hopper+)
-- Prefix caching
-- Chunked prefill
-- Controlled GPU memory utilization
+High-Throughput vLLM Serving & Concurrent Throughput Benchmark.
+Supports launching an OpenAI-compatible vLLM server or running a concurrent
+batch benchmark measuring latency, total tokens/sec, and p50/p95 timings.
 """
 
-from vllm import LLM, SamplingParams
+from __future__ import annotations
+
 import argparse
+import json
+import subprocess
+import time
+from statistics import quantiles
+from typing import Any
 
-def create_llm(
-    model: str,
-    max_model_len: int = 16384,
-    gpu_memory_utilization: float = 0.92,
-    kv_cache_dtype: str = "fp8",
-    enable_prefix_caching: bool = True,
-    tensor_parallel_size: int = 1,
-):
-    """
-    Create a high-performance vLLM engine.
-    """
-    llm = LLM(
-        model=model,
-        tensor_parallel_size=tensor_parallel_size,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=gpu_memory_utilization,
-        kv_cache_dtype=kv_cache_dtype,          # fp8 strongly recommended on H100+
-        enable_prefix_caching=enable_prefix_caching,
-        trust_remote_code=True,
-        # Additional advanced flags (uncomment as needed):
-        # enable_chunked_prefill=True,
-        # max_num_seqs=256,
-        # max_num_batched_tokens=8192,
-    )
-    return llm
+from vllm import LLM, SamplingParams
 
 
-def demo_generate(llm: LLM):
-    sampling_params = SamplingParams(
-        temperature=0.6,
-        top_p=0.9,
-        max_tokens=512,
-    )
+BENCHMARK_PROMPTS = [
+    "Derive the key mathematical difference between PPO critic value estimation and GRPO group-relative advantage normalization.",
+    "Explain how PagedAttention eliminates KV-cache fragmentation during high-concurrency LLM serving.",
+    "Compare LoRA, rsLoRA, and DoRA weight updates on linear projection layers in transformers.",
+    "How does speculative decoding accelerate autoregressive token generation without changing output distribution?",
+    "Design a two-stage SFT -> GRPO training curriculum for multi-step arithmetic reasoning.",
+    "What are attention sinks in streaming LLMs, and how do they stabilize long-context perplexity?",
+    "Explain why 4-bit NF4 quantization with double quantization preserves reasoning quality better than naive uniform INT4.",
+    "How should reward functions be shaped to prevent reward hacking on XML-formatted math answers?",
+]
 
-    prompts = [
-        "Explain Group Relative Policy Optimization (GRPO) and why it is more memory-efficient than PPO.",
-        "What are the main benefits of using FP8 KV cache in vLLM?",
+
+def launch_openai_server(args: argparse.Namespace) -> None:
+    cmd = [
+        "python",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        args.model,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--gpu-memory-utilization",
+        str(args.gpu_mem_util),
+        "--max-model-len",
+        str(args.max_model_len),
+        "--tensor-parallel-size",
+        str(args.tp_size),
+        "--enable-prefix-caching",
     ]
+    if args.quantization:
+        cmd.extend(["--quantization", args.quantization])
+    if args.speculative_model:
+        cmd.extend(["--speculative-model", args.speculative_model, "--num-speculative-tokens", str(args.num_speculative_tokens)])
 
-    outputs = llm.generate(prompts, sampling_params)
+    print("Launching vLLM OpenAI server:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
-    for i, output in enumerate(outputs):
-        print(f"\n===== Prompt {i+1} =====")
-        print(output.prompt)
-        print("\n----- Response -----")
-        print(output.outputs[0].text)
-        print("=" * 50)
+
+def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    llm_kwargs: dict[str, Any] = {
+        "model": args.model,
+        "gpu_memory_utilization": args.gpu_mem_util,
+        "max_model_len": args.max_model_len,
+        "tensor_parallel_size": args.tp_size,
+        "enable_prefix_caching": True,
+        "trust_remote_code": True,
+    }
+    if args.quantization:
+        llm_kwargs["quantization"] = args.quantization
+    if args.speculative_model:
+        llm_kwargs["speculative_model"] = args.speculative_model
+        llm_kwargs["num_speculative_tokens"] = args.num_speculative_tokens
+
+    llm = LLM(**llm_kwargs)
+    params = SamplingParams(temperature=args.temperature, top_p=0.95, max_tokens=args.max_tokens)
+
+    _ = llm.generate(BENCHMARK_PROMPTS[:2], SamplingParams(temperature=0.0, max_tokens=32))
+
+    prompts = (BENCHMARK_PROMPTS * ((args.num_requests // len(BENCHMARK_PROMPTS)) + 1))[: args.num_requests]
+    per_req_latencies: list[float] = []
+    total_tokens = 0
+
+    t_start = time.perf_counter()
+    outputs = llm.generate(prompts, params)
+    total_elapsed = max(1e-6, time.perf_counter() - t_start)
+
+    for out in outputs:
+        gen_len = len(out.outputs[0].token_ids)
+        total_tokens += gen_len
+        metrics = getattr(out, "metrics", None)
+        if metrics and metrics.first_token_time and metrics.finished_time:
+            per_req_latencies.append(max(0.0, metrics.finished_time - metrics.first_token_time))
+
+    lat_stats: dict[str, float] = {}
+    if per_req_latencies:
+        qs = quantiles(per_req_latencies, n=20)
+        lat_stats = {
+            "mean_decode_s": round(sum(per_req_latencies) / len(per_req_latencies), 4),
+            "p50_decode_s": round(qs[9], 4),
+            "p95_decode_s": round(qs[18], 4),
+        }
+
+    return {
+        "model": args.model,
+        "requests": len(prompts),
+        "total_output_tokens": total_tokens,
+        "elapsed_seconds": round(total_elapsed, 3),
+        "output_tokens_per_sec": round(total_tokens / total_elapsed, 2),
+        "requests_per_sec": round(len(prompts) / total_elapsed, 2),
+        "latency": lat_stats,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Advanced vLLM Serving & Benchmark Runner")
+    parser.add_argument("--mode", choices=["benchmark", "serve"], default="benchmark")
+    parser.add_argument("--model", default="unsloth/llama-3-8b-Instruct-bnb-4bit")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--gpu-mem-util", type=float, default=0.88)
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--tp-size", type=int, default=1)
+    parser.add_argument("--quantization", default=None, help="e.g. fp8, awq, gptq")
+    parser.add_argument("--speculative-model", default=None)
+    parser.add_argument("--num-speculative-tokens", type=int, default=5)
+    parser.add_argument("--num-requests", type=int, default=16)
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.mode == "serve":
+        launch_openai_server(args)
+    else:
+        print(json.dumps(run_benchmark(args), indent=2))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="unsloth/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--max-model-len", type=int, default=8192)
-    parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size")
-    args = parser.parse_args()
-
-    print("Initializing advanced vLLM engine...")
-    print(f"Model: {args.model}")
-    print(f"Max model length: {args.max_model_len}")
-    print(f"KV cache dtype: fp8")
-    print(f"Prefix caching: enabled")
-
-    llm = create_llm(
-        model=args.model,
-        max_model_len=args.max_model_len,
-        tensor_parallel_size=args.tp,
-    )
-
-    demo_generate(llm)
+    main()
