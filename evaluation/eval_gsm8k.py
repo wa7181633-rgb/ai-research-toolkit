@@ -1,197 +1,162 @@
 """
-GSM8K & Math Reasoning Evaluation Harness using vLLM.
-Computes exact numeric accuracy, XML formatting compliance, average latency,
-and saves detailed per-example audit logs + summary JSON.
+GSM8K & Custom JSONL Benchmark Evaluator
+Supports HuggingFace model IDs, local checkpoints, or PEFT adapter directories.
 """
-
-from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import time
-from pathlib import Path
-from typing import Any
+from typing import Dict, List, Optional, Tuple
 
+import torch
 from datasets import load_dataset
-from vllm import LLM, SamplingParams
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-_NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?(?:/\d+)?")
+def extract_ground_truth(answer_field: str) -> str:
+    if "####" in answer_field:
+        return answer_field.split("####")[-1].strip()
+    return answer_field.strip()
 
 
-def parse_numeric(raw: str | None) -> float | None:
-    if not raw:
-        return None
-    cleaned = raw.strip().replace(",", "").replace("$", "")
-    if "/" in cleaned:
-        parts = cleaned.split("/", 1)
-        try:
-            num = float(parts[0])
-            den = float(parts[1])
-            return num / den if den != 0 else None
-        except ValueError:
-            return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-def extract_prediction(text: str) -> tuple[float | None, bool]:
-    """Return (parsed_number, strict_xml_valid)."""
-    xml_match = re.search(
-        r"<thought>\s*(.+?)\s*</thought>\s*<answer>\s*([-+]?\d[\d,]*(?:\.\d+)?(?:/\d+)?)\s*</answer>",
-        text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+def extract_prediction(response: str) -> str:
+    xml_match = re.search(r"<answer>\s*(.*?)\s*</answer>", response, flags=re.DOTALL | re.IGNORECASE)
     if xml_match:
-        return parse_numeric(xml_match.group(2)), True
+        return xml_match.group(1).strip()
 
-    tag_only = re.search(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.DOTALL | re.IGNORECASE)
-    if tag_only:
-        nums = _NUM_RE.findall(tag_only.group(1))
-        if nums:
-            return parse_numeric(nums[-1]), False
+    hash_match = re.search(r"####\s*([^\n]+)", response)
+    if hash_match:
+        return hash_match.group(1).strip()
 
-    nums = _NUM_RE.findall(text)
-    if nums:
-        return parse_numeric(nums[-1]), False
-    return None, False
+    numbers = re.findall(r"-?\d+(?:\.\d+)?", response.replace(",", ""))
+    return numbers[-1] if numbers else ""
 
 
-def extract_ground_truth(raw_answer: str) -> float | None:
-    if "####" in raw_answer:
-        tail = raw_answer.split("####", 1)[1]
-        nums = _NUM_RE.findall(tail)
-        if nums:
-            return parse_numeric(nums[-1])
-    nums = _NUM_RE.findall(raw_answer)
-    return parse_numeric(nums[-1]) if nums else None
+def normalize_val(val: str) -> str:
+    cleaned = val.strip().replace(",", "").rstrip(".")
+    try:
+        num = float(cleaned)
+        if num.is_integer():
+            return str(int(num))
+        return f"{num:.6f}".rstrip("0").rstrip(".")
+    except ValueError:
+        return cleaned
 
 
-def build_prompt(question: str) -> str:
-    return (
-        "Solve the math problem step by step inside <thought>...</thought>, "
-        "then output ONLY the final number inside <answer>...</answer>.\n\n"
-        f"Question: {question.strip()}\n"
-    )
+def load_model_and_tokenizer(model_path: str, base_model: Optional[str] = None) -> Tuple:
+    tokenizer = AutoTokenizer.from_pretrained(base_model or model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
+    dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
+    device_map = "auto" if torch.cuda.is_available() else None
 
-def evaluate(
-    model_path: str,
-    dataset_name: str,
-    split: str,
-    max_samples: int,
-    max_tokens: int,
-    temperature: float,
-    tensor_parallel_size: int,
-    gpu_memory_utilization: float,
-    report_path: str,
-) -> dict[str, Any]:
-    local_path = Path(dataset_name)
-    if local_path.exists():
-        ds = load_dataset("json", data_files=str(local_path), split="train")
-    elif dataset_name == "openai/gsm8k":
-        ds = load_dataset("openai/gsm8k", "main", split=split)
+    adapter_cfg_path = os.path.join(model_path, "adapter_config.json")
+    if os.path.isdir(model_path) and os.path.isfile(adapter_cfg_path):
+        with open(adapter_cfg_path, "r", encoding="utf-8") as f:
+            adapter_cfg = json.load(f)
+        resolved_base = base_model or adapter_cfg.get("base_model_name_or_path")
+        if not resolved_base:
+            raise ValueError("Adapter checkpoint detected, but no --base-model could be resolved.")
+        base = AutoModelForCausalLM.from_pretrained(resolved_base, dtype=dtype, device_map=device_map, trust_remote_code=True)
+        model = PeftModel.from_pretrained(base, model_path)
     else:
-        ds = load_dataset(dataset_name, split=split)
+        model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype, device_map=device_map, trust_remote_code=True)
 
-    if max_samples > 0:
-        ds = ds.select(range(min(max_samples, len(ds))))
+    model.eval()
+    return model, tokenizer
 
-    prompts = [build_prompt(row.get("question") or row.get("instruction") or "") for row in ds]
-    ground_truths = [extract_ground_truth(str(row.get("answer") or row.get("solution") or "")) for row in ds]
 
-    llm = LLM(
-        model=model_path,
-        tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=gpu_memory_utilization,
-        trust_remote_code=True,
-    )
-    sampling_params = SamplingParams(temperature=temperature, top_p=0.95 if temperature > 0 else 1.0, max_tokens=max_tokens)
+def load_eval_samples(dataset_path: Optional[str], split: str, max_samples: Optional[int]) -> List[Dict]:
+    if dataset_path and os.path.isfile(dataset_path):
+        rows: List[Dict] = []
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    else:
+        ds = load_dataset("gsm8k", "main", split=split)
+        rows = [dict(x) for x in ds]
 
-    t0 = time.perf_counter()
-    outputs = llm.generate(prompts, sampling_params)
-    elapsed_s = max(1e-6, time.perf_counter() - t0)
-
-    correct = 0
-    xml_valid_count = 0
-    total_completion_tokens = 0
-    records: list[dict[str, Any]] = []
-
-    for idx, (out, gt) in enumerate(zip(outputs, ground_truths)):
-        gen_text = out.outputs[0].text
-        comp_tokens = len(out.outputs[0].token_ids)
-        total_completion_tokens += comp_tokens
-        pred, xml_ok = extract_prediction(gen_text)
-        if xml_ok:
-            xml_valid_count += 1
-
-        is_correct = False
-        if pred is not None and gt is not None:
-            is_correct = abs(pred - gt) <= max(1e-4, 1e-4 * abs(gt))
-        if is_correct:
-            correct += 1
-
-        records.append(
-            {
-                "index": idx,
-                "ground_truth": gt,
-                "prediction": pred,
-                "correct": is_correct,
-                "xml_valid": xml_ok,
-                "completion_tokens": comp_tokens,
-                "response": gen_text,
-            }
-        )
-
-    total = len(records)
-    summary = {
-        "model": model_path,
-        "dataset": dataset_name,
-        "split": split,
-        "samples": total,
-        "accuracy": round(correct / max(1, total), 4),
-        "xml_format_compliance": round(xml_valid_count / max(1, total), 4),
-        "elapsed_seconds": round(elapsed_s, 3),
-        "throughput_tokens_per_sec": round(total_completion_tokens / elapsed_s, 2),
-    }
-
-    out_file = Path(report_path)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    out_file.write_text(json.dumps({"summary": summary, "records": records}, indent=2), encoding="utf-8")
-    return summary
+    if max_samples is not None:
+        rows = rows[:max_samples]
+    return rows
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GSM8K Evaluation Harness via vLLM")
-    parser.add_argument("--model", default="unsloth/llama-3-8b-Instruct-bnb-4bit")
-    parser.add_argument("--dataset", default="openai/gsm8k")
-    parser.add_argument("--split", default="test")
+    parser = argparse.ArgumentParser(description="Evaluate model or LoRA/DoRA adapter on GSM8K or JSONL.")
+    parser.add_argument("--model", type=str, required=True, help="Model ID, checkpoint dir, or PEFT adapter dir")
+    parser.add_argument("--base-model", type=str, default=None, help="Optional base model override for PEFT adapters")
+    parser.add_argument("--dataset", type=str, default=None, help="Optional path to custom .jsonl file")
+    parser.add_argument("--split", type=str, default="test", choices=["train", "test"])
     parser.add_argument("--max-samples", type=int, default=100)
-    parser.add_argument("--max-tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--gpu-mem-util", type=float, default=0.85)
-    parser.add_argument("--report", default="benchmarks/gsm8k_eval_report.json")
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--save-results", type=str, default="outputs\\eval_gsm8k_results.jsonl")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    summary = evaluate(
-        model_path=args.model,
-        dataset_name=args.dataset,
-        split=args.split,
-        max_samples=args.max_samples,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        tensor_parallel_size=args.tp_size,
-        gpu_memory_utilization=args.gpu_mem_util,
-        report_path=args.report,
-    )
-    print(json.dumps(summary, indent=2))
+    os.makedirs(os.path.dirname(args.save_results) or ".", exist_ok=True)
+
+    model, tokenizer = load_model_and_tokenizer(args.model, args.base_model)
+    samples = load_eval_samples(args.dataset, args.split, args.max_samples)
+
+    correct = 0
+    total = len(samples)
+    results = []
+
+    for idx, item in enumerate(samples):
+        question = item.get("question") or item.get("prompt") or ""
+        gt_raw = extract_ground_truth(str(item.get("answer") or item.get("ground_truth") or ""))
+        gt_norm = normalize_val(gt_raw)
+
+        prompt = (
+            "Solve step by step inside <reasoning>...</reasoning> tags, "
+            "then write the final numeric answer inside <answer>...</answer> tags.\n\n"
+            f"Question: {question}\n"
+        )
+        inputs = tokenizer(prompt, return_tensors="pt")
+        if torch.cuda.is_available():
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        gen_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+        response = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+
+        pred_raw = extract_prediction(response)
+        pred_norm = normalize_val(pred_raw)
+        is_correct = bool(pred_norm and pred_norm == gt_norm)
+        if is_correct:
+            correct += 1
+
+        results.append(
+            {
+                "index": idx,
+                "question": question,
+                "ground_truth": gt_norm,
+                "prediction": pred_norm,
+                "correct": is_correct,
+                "response": response,
+            }
+        )
+
+    accuracy = (correct / total * 100.0) if total > 0 else 0.0
+    print(f"Evaluated {total} samples | Correct: {correct} | Accuracy: {accuracy:.2f}%")
+
+    with open(args.save_results, "w", encoding="utf-8") as out_f:
+        for r in results:
+            out_f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"Detailed evaluation log saved to: {args.save_results}")
 
 
 if __name__ == "__main__":
