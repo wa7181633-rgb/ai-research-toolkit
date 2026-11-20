@@ -9,7 +9,18 @@ Production-structured research scripts for **SFT -> GRPO reasoning alignment**, 
 - `inference/vllm_server.py`: Supports both OpenAI-compatible serving (`--mode serve`, prefix caching, quantization, speculative decoding) and concurrent throughput/latency benchmarking (`--mode benchmark`).
 - `pipeline/synthetic_data.py`: Generates deduplicated multi-step word problems verified via safe AST evaluation into `.jsonl` datasets.
 - `interpretability/residual_probe.py`: Transformer Lens residual stream probe (`hook_resid_post` + `apply_ln_to_stack` + unembedding) tracking candidate token probabilities across layers.
-- `requirements.txt`: Dependencies for training, GRPO/SFT, vLLM, and interpretability.
+- `quantum/cudaq_smoke_test.py`: Optional CUDA-Q Bell-state smoke test. See [CUDA-Q setup and validation](docs/CUDA_Q_SMOKE_TEST.md).
+- `requirements.txt`: Dependencies for training, GRPO/SFT, vLLM, and interpretability. CUDA-Q remains an optional separate SDK.
+
+## Platform Direction
+
+The target direction is a **Quantum-AI research platform**: preserve and stabilize the existing classical AI pipeline, then add optional quantum and hybrid classical-quantum experiment backends. The roadmap defines the architecture, NVIDIA technology alignment, research tracks (QNN and QAOA), experiment metadata, and phased delivery criteria.
+
+See [docs/QUANTUM_AI_PLATFORM_ROADMAP.md](docs/QUANTUM_AI_PLATFORM_ROADMAP.md).
+
+## Engineering Audit
+
+See [docs/NVIDIA_SKILLS_ALIGNMENT_AUDIT.md](docs/NVIDIA_SKILLS_ALIGNMENT_AUDIT.md) for a static readiness review, NVIDIA Skills catalog mapping, prioritized gaps, and recommended next steps. Runtime/GPU validation is explicitly marked separately.
 
 ## Quick Execution Flow
 
@@ -25,6 +36,9 @@ python evaluation/eval_gsm8k.py --model artifacts/math_pipeline/grpo_policy --ma
 
 # 4. Benchmark or serve via vLLM
 python inference/vllm_server.py --mode benchmark --model unsloth/llama-3-8b-Instruct-bnb-4bit --num-requests 16
+
+# 5. Optional: run CUDA-Q simulator smoke test (after installing CUDA-Q)
+python quantum/cudaq_smoke_test.py --shots 1000
 ```
 
 ---
